@@ -52,7 +52,7 @@ VERSION="1.0"
 # -----------------------------------------------------------------------------
 ROLE="base"
 STEPS_ARG=""
-ADMIN_USER="adm-afeipel"           # compte d'administration nominatif (même convention que l'AD)
+ADMIN_USER=""                      # vide = compte existant qui lance "sudo" (aucun compte créé)
 ADMIN_PUBKEY=""                    # clé publique SSH (texte ou chemin de fichier)
 ADMIN_NET="10.10.20.0/24"          # réseau(x) d'administration autorisé(s) en SSH, séparés par des virgules
 SSH_PORT="22"
@@ -74,7 +74,7 @@ usage() {
 Options :
   --role base|web|wazuh      rôle du serveur (défaut : base)
   --steps LISTE              ex. "0-11,16" ou "4,5" (défaut : selon le rôle)
-  --admin NOM                compte admin nominatif (défaut : adm-afeipel)
+  --admin NOM                compte admin (défaut : le compte qui lance sudo ; créé seulement s'il n'existe pas)
   --admin-pubkey CLÉ|FICHIER clé publique SSH du compte admin
   --admin-net CIDR[,CIDR]    réseau(x) autorisé(s) en SSH (défaut : 10.10.20.0/24)
   --ssh-port N               port SSH (défaut : 22)
@@ -125,6 +125,12 @@ done
 . /etc/os-release
 if [[ "${ID:-}" != "ubuntu" ]]; then echo "Ubuntu requis (détecté : ${ID:-?})"; exit 1; fi
 case "${VERSION_ID:-}" in 22.04|24.04) ;; *) echo "Attention : testé pour 22.04 / 24.04 (détecté : ${VERSION_ID:-?})" ;; esac
+
+# Compte admin : par défaut, l'utilisateur existant qui a lancé sudo (pas de création de compte)
+if [[ -z "$ADMIN_USER" ]]; then
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then ADMIN_USER="$SUDO_USER"
+    else echo "Lancé en root direct : précisez le compte admin avec --admin NOM (ou lancez via sudo depuis votre compte)."; exit 1; fi
+fi
 
 # Clé publique passée sous forme de fichier
 if [[ -n "$ADMIN_PUBKEY" && -f "$ADMIN_PUBKEY" ]]; then ADMIN_PUBKEY="$(cat "$ADMIN_PUBKEY")"; fi
@@ -250,6 +256,13 @@ step_01_sauvegarde() {
 #  ÉTAPE 2 - Mises à jour
 # =============================================================================
 step_02_mises_a_jour() {
+    # Wazuh : ses composants ne doivent JAMAIS être mis à jour par un simple apt upgrade
+    # (indexer, manager, dashboard et agents doivent rester à la même version -> procédure officielle)
+    local w held=()
+    for w in wazuh-manager wazuh-indexer wazuh-dashboard filebeat wazuh-agent; do
+        if pkg_installed "$w"; then apt-mark hold "$w" >/dev/null; held+=("$w"); fi
+    done
+    [[ ${#held[@]} -gt 0 ]] && ok "Paquets gelés AVANT la mise à jour : ${held[*]}"
     apt-get update -q >/dev/null
     apt-get "${APT_OPTS[@]}" full-upgrade >/dev/null
     apt-get "${APT_OPTS[@]}" autoremove --purge >/dev/null
@@ -582,6 +595,23 @@ step_05_parefeu() {
                 ufw allow proto tcp from "$net" to any port 55000 comment 'Wazuh API' >/dev/null
             done
             [[ -n "$FW_SYSLOG" ]] && ufw allow proto udp from "$FW_SYSLOG" to any port 514 comment 'Syslog ACME-FW01' >/dev/null
+            # Anti-lockout dashboard : le PC qui administre en SSH garde l'accès au dashboard
+            for peer in $(current_ssh_peers); do
+                if ! ip_in_nets "$peer" "$ADMIN_NET"; then
+                    ufw allow proto tcp from "$peer" to any port 443 comment 'Dashboard - PC admin actuel' >/dev/null
+                    warn "Dashboard Wazuh ouvert pour $peer (hors $ADMIN_NET) : corrigez --admin-net si c'est votre poste d'administration"
+                fi
+            done
+            # Agents déjà connectés hors des réseaux déclarés : signalés (ils seraient coupés)
+            if [[ -f /var/ossec/bin/agent_control ]]; then
+                local aip
+                for aip in $(/var/ossec/bin/agent_control -l 2>/dev/null | grep -oE 'IP: [0-9.]+' | awk '{print $2}' | sort -u); do
+                    if [[ "$aip" != "127.0.0.1" ]] && ! ip_in_nets "$aip" "$AGENT_NETS"; then
+                        ufw allow proto tcp from "$aip" to any port 1514,1515 comment 'Agent Wazuh existant' >/dev/null
+                        warn "Agent $aip hors de --agent-nets ($AGENT_NETS) : autorisé quand même, corrigez --agent-nets"
+                    fi
+                done
+            fi
             ok "Rôle wazuh : 1514-1515 depuis $AGENT_NETS ; 443 et 55000 depuis $ADMIN_NET ; indexer 9200 non exposé" ;;
     esac
 
